@@ -1,0 +1,94 @@
+@page "/login"
+@attribute [AllowAnonymous]
+@attribute [EnableRateLimiting("login")]
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Authentication.Cookies
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.AspNetCore.RateLimiting
+@inject IConfiguration Config
+@inject NavigationManager Nav
+
+<PageTitle>Log in</PageTitle>
+
+<div class="login">
+    <h1>Log in</h1>
+
+    @if (error is not null)
+    {
+        <div class="alert alert-danger" role="alert">@error</div>
+    }
+
+    <EditForm Model="Input!" method="post" OnSubmit="LogInAsync" FormName="login">
+        <div class="mb-3">
+            <label for="username" class="form-label">Username</label>
+            <InputText id="username" class="form-control" @bind-Value="Input!.Username" autocomplete="username" autofocus />
+        </div>
+        <div class="mb-3">
+            <label for="password" class="form-label">Password</label>
+            <InputText id="password" type="password" class="form-control" @bind-Value="Input!.Password" autocomplete="current-password" />
+        </div>
+        <button type="submit" class="btn btn-primary w-100">Log in</button>
+    </EditForm>
+</div>
+
+@code {
+    // Static server rendering (no @rendermode), so HttpContext is available for SignInAsync.
+    [CascadingParameter] private HttpContext HttpContext { get; set; } = default!;
+    [SupplyParameterFromForm] private LoginInput? Input { get; set; }
+    [SupplyParameterFromQuery] private string? ReturnUrl { get; set; }
+
+    private string? error;
+
+    protected override void OnInitialized() => Input ??= new();
+
+    private async Task LogInAsync()
+    {
+        var username = Config["Auth:Username"];
+        var hash = Config["Auth:PasswordHash"];
+        if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(hash))
+        {
+            error = "No login is set up yet. Set Auth:Username and Auth:PasswordHash (see the README).";
+            return;
+        }
+
+        if (!string.Equals(Input!.Username?.Trim(), username, StringComparison.OrdinalIgnoreCase)
+            || !PasswordMatches(hash, Input!.Password ?? ""))
+        {
+            await Task.Delay(1000);   // slows down guessing
+            error ??= "Wrong username or password.";
+            return;
+        }
+
+        var identity = new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, username) },
+            CookieAuthenticationDefaults.AuthenticationScheme);
+        await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+            new ClaimsPrincipal(identity), new AuthenticationProperties { IsPersistent = true });
+
+        Nav.NavigateTo(IsLocalPath(ReturnUrl) ? ReturnUrl! : "/");
+    }
+
+    private bool PasswordMatches(string hash, string password)
+    {
+        try
+        {
+            return new PasswordHasher<string>().VerifyHashedPassword("", hash, password)
+                != PasswordVerificationResult.Failed;
+        }
+        catch (FormatException)
+        {
+            error = "Auth:PasswordHash isn't a valid hash. Make a new one with: dotnet run -- hash-password";
+            return false;
+        }
+    }
+
+    // Only redirect back to pages on this site, never to another site.
+    private static bool IsLocalPath(string? url) =>
+        !string.IsNullOrEmpty(url) && url.StartsWith('/') && !url.StartsWith("//") && !url.StartsWith("/\\");
+
+    private sealed class LoginInput
+    {
+        public string? Username { get; set; }
+        public string? Password { get; set; }
+    }
+}

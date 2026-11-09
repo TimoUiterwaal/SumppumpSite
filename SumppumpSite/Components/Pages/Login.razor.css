@@ -1,0 +1,9 @@
+.login {
+    max-width: 360px;
+    margin: 2rem auto;
+}
+
+    .login h1 {
+        font-size: 1.5rem;
+        margin-bottom: 1.25rem;
+    }

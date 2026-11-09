@@ -1,0 +1,29 @@
+# Add to the bottom of the sumppumpmonitor config in ESPHome (top level, not indented).
+# Replace the URL with your Azure web app's "Default domain" (Overview page in the portal).
+# For a site running on your desktop instead: http://192.168.1.7:5026/api/readings
+#
+# Also add the key to ESPHome's secrets (Secrets button, top right of Device Builder):
+#   sump_api_key: "the value from: dotnet run -- new-api-key"
+
+http_request:        # if Step 8 already added this, merge these two settings into it
+  timeout: 5s              # HTTPS takes longer than plain http; still gives up if Azure is unreachable
+  watchdog_timeout: 15s    # don't let a slow request trip the reset watchdog
+
+interval:
+  - interval: 15s
+    startup_delay: 60s     # let the ESP32 finish booting (and mark an update good) before the first post
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - lambda: 'return !isnan(id(sump_level).state);'
+          then:
+            - http_request.post:
+                url: https://<your-app>.azurewebsites.net/api/readings
+                request_headers:
+                  Content-Type: application/json
+                  X-Api-Key: !secret sump_api_key
+                json: |-
+                  root["level"] = id(sump_level).state;
+                  root["volts"] = id(probe_v).state;

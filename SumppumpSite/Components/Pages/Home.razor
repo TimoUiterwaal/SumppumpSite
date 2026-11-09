@@ -1,0 +1,211 @@
+@page "/"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@inject ReadingStore Store
+@inject IJSRuntime JS
+
+<PageTitle>Sump level</PageTitle>
+
+<div class="sump">
+    <h1>Sump level</h1>
+    <div class="now"><b>@(latest is null ? "–" : latest.Level.ToString("0.0"))</b><span>in</span></div>
+    @{ var status = Status(); }
+    <div class="@($"status status-{status.Kind}")" role="status"><i aria-hidden="true">@status.Icon</i><span>@status.Text</span></div>
+
+    <div class="controls">
+        <div class="btn-group" role="group" aria-label="Time range">
+            @foreach (var r in Ranges)
+            {
+                var on = r.Hours == hours && !zoomed;
+                <button type="button" class="btn @(on ? "btn-primary" : "btn-outline-primary")"
+                        aria-pressed="@(on ? "true" : "false")" @onclick="() => PickRange(r.Hours)">@r.Label</button>
+            }
+        </div>
+        @if (zoomed)
+        {
+            <button type="button" class="btn btn-outline-secondary" @onclick="ZoomOut">Zoom out</button>
+        }
+    </div>
+
+    <section class="stats" aria-label="This window">
+        <div class="stat"><div class="label">Lowest</div><div class="value">@Inches(chart?.Lowest)</div></div>
+        <div class="stat"><div class="label">Highest</div><div class="value">@Inches(chart?.Highest)</div></div>
+        <div class="stat"><div class="label">Pump runs</div><div class="value">@(chart is { Points.Count: > 0 } ? chart.PumpRuns.ToString() : "–")</div></div>
+    </section>
+
+    <div class="chart-card">
+        <canvas @ref="canvas" role="img" aria-label="Sump water level over time"></canvas>
+        @if (emptyMessage is not null)
+        {
+            <div class="empty">@emptyMessage</div>
+        }
+    </div>
+
+    <p class="hint">
+        <span class="mouse-only">Drag across the chart to zoom in; double-click to zoom out.</span>
+        <span class="touch-only">Pinch the chart to zoom in.</span>
+        <a href="@($"api/readings.csv?start={viewStart}&end={viewEnd}")" download data-enhance-nav="false">Download these readings (CSV)</a>
+    </p>
+</div>
+
+@code {
+    private static readonly (int Hours, string Label)[] Ranges = [(1, "1h"), (6, "6h"), (24, "24h"), (168, "7d"), (720, "30d")];
+
+    // Lines across the chart, in the same units as "Sump level". Once the pit-floor offset is in
+    // your ESP32 calibration, these are inches from the floor.
+    private static readonly ChartMark[] Marks = [new(7, "Pump starts"), new(18, "Backup pump starts")];
+
+    private ElementReference canvas;
+    private IJSObjectReference? module;
+    private DotNetObjectReference<Home>? selfRef;
+    private readonly CancellationTokenSource cts = new();
+
+    private bool loaded;
+    private int hours = 24;
+    private bool zoomed;
+    private long viewStart, viewEnd;
+    private int loadSeq;
+    private Reading? latest;
+    private ChartData? chart;
+    private string? emptyMessage;
+    private string? error;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/sumpChart.js");
+        selfRef = DotNetObjectReference.Create(this);
+        await module.InvokeVoidAsync("create", canvas, selfRef, Marks);
+
+        var saved = await module.InvokeAsync<int?>("loadHours");
+        if (saved is int h && Ranges.Any(r => r.Hours == h)) hours = h;
+
+        await RefreshAsync(includeChart: true);
+        _ = RunTimerAsync();
+    }
+
+    // Every 5 s: redraw the "Updated … ago" line. Every 15 s: new data.
+    private async Task RunTimerAsync()
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        var tick = 0;
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cts.Token))
+            {
+                tick++;
+                await InvokeAsync(async () =>
+                {
+                    if (tick % 3 == 0) await RefreshAsync(includeChart: !zoomed);
+                    else StateHasChanged();
+                });
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (JSDisconnectedException) { }
+        catch (ObjectDisposedException) { }
+    }
+
+    private async Task RefreshAsync(bool includeChart)
+    {
+        try
+        {
+            latest = await Store.LatestAsync();
+            if (includeChart)
+            {
+                if (!zoomed)
+                {
+                    viewEnd = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    viewStart = viewEnd - hours * 3_600_000L;
+                }
+                await LoadChartAsync();
+            }
+            error = null;
+        }
+        catch (Exception ex) when (ex is not JSDisconnectedException and not OperationCanceledException)
+        {
+            error = ex.Message;
+        }
+        loaded = true;
+        StateHasChanged();
+    }
+
+    private async Task LoadChartAsync()
+    {
+        var my = ++loadSeq;
+        var (start, end) = (viewStart, viewEnd);
+        var data = await Store.ChartAsync(start, end);
+        if (my != loadSeq) return;   // a newer load (zoom, range change) already replaced this one
+
+        chart = data;
+        emptyMessage = data.Points.Count == 0 ? "No readings in this window yet." : null;
+        if (module is not null)
+            await module.InvokeVoidAsync("setData", start, end, data.BucketSeconds, data.Points);
+    }
+
+    private async Task PickRange(int h)
+    {
+        hours = h;
+        if (module is not null) await module.InvokeVoidAsync("saveHours", h);
+        await ZoomOut();
+    }
+
+    private async Task ZoomOut()
+    {
+        zoomed = false;
+        if (module is not null) await module.InvokeVoidAsync("resetZoom");
+        await RefreshAsync(includeChart: true);
+    }
+
+    // Called by sumpChart.js after a drag or pinch zoom.
+    [JSInvokable]
+    public async Task OnZoom(double start, double end)
+    {
+        zoomed = true;
+        viewStart = (long)start;
+        viewEnd = (long)end;
+        await LoadChartAsync();
+        StateHasChanged();
+    }
+
+    // Called by sumpChart.js on double-click.
+    [JSInvokable]
+    public Task OnZoomOut() => ZoomOut();
+
+    private (string Kind, string Icon, string Text) Status()
+    {
+        if (error is not null) return ("critical", "✕", $"Couldn't read the database: {error}");
+        if (!loaded) return ("muted", "●", "Loading…");
+        if (latest is null) return ("muted", "●", "No readings yet. Check the URL in the ESP32 config.");
+
+        var age = TimeSpan.FromMilliseconds(Math.Max(0, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - latest.Ts));
+        return age > TimeSpan.FromMinutes(1)
+            ? ("warning", "▲", $"No new reading for {Ago(age)}")
+            : ("good", "●", $"Updated {Ago(age)} ago · {latest.Volts:0.000} V");
+    }
+
+    private static string Ago(TimeSpan t) =>
+        t.TotalSeconds < 60 ? $"{(int)t.TotalSeconds} s"
+        : t.TotalMinutes < 60 ? $"{(int)Math.Round(t.TotalMinutes)} min"
+        : t.TotalHours < 48 ? $"{(int)Math.Round(t.TotalHours)} h"
+        : $"{(int)Math.Round(t.TotalDays)} days";
+
+    private static string Inches(double? v) => v is double d ? $"{d:0.0} in" : "–";
+
+    public async ValueTask DisposeAsync()
+    {
+        cts.Cancel();
+        try
+        {
+            if (module is not null)
+            {
+                await module.InvokeVoidAsync("dispose");
+                await module.DisposeAsync();
+            }
+        }
+        catch (JSDisconnectedException) { }
+        selfRef?.Dispose();
+        cts.Dispose();
+    }
+}
