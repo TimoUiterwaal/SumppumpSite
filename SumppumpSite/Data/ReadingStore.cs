@@ -8,6 +8,8 @@ public class ReadingStore(IDbContextFactory<SumpDb> dbFactory)
 {
     // A pump run = the level falls at least this much within 90 s.
     public const double PumpDropInches = 1.5;
+    const long PumpWindowMs = 90_000;      // how far back to look for the higher level
+    const long PumpRunGapMs = 180_000;     // count each run once
 
     public async Task AddAsync(double level, double volts)
     {
@@ -39,14 +41,39 @@ public class ReadingStore(IDbContextFactory<SumpDb> dbFactory)
     // Everything the chart needs for one time window.
     public async Task<ChartData> ChartAsync(long startMs, long endMs)
     {
-        var rows = await RangeAsync(startMs, endMs);
         var bucketMs = PickBucket(endMs - startMs);
+        await using var db = await dbFactory.CreateDbContextAsync();
+        var points = await PointsAsync(db, startMs, endMs, bucketMs);
+        var (runs, lastRun) = await PumpRunsAsync(db, startMs, endMs, countAfter: long.MinValue, lastRun: 0);
         return new ChartData(
             BucketSeconds: (int)(bucketMs / 1000),
-            PumpRuns: CountPumpRuns(rows),
-            Lowest: rows.Count > 0 ? rows.Min(r => r.Level) : null,
-            Highest: rows.Count > 0 ? rows.Max(r => r.Level) : null,
-            Points: Downsample(rows, bucketMs));
+            PumpRuns: runs,
+            Lowest: points.Count > 0 ? points.Min(p => p.Lo) : null,
+            Highest: points.Count > 0 ? points.Max(p => p.Hi) : null,
+            Points: points,
+            LastTs: await LastTsAsync(db, startMs, endMs),
+            LastPumpRunTs: lastRun > 0 ? lastRun : null);
+    }
+
+    // Only what's new since a live chart last loaded (sinceTs = the newest reading it has).
+    // Sends a few points instead of the whole window. For bucketed charts the last bucket was
+    // probably still filling, so it's sent again and replaces the old one.
+    // Lowest/Highest cover only the new readings; the page merges them with what it has.
+    public async Task<ChartUpdate> ChartUpdateAsync(long sinceTs, long endMs, int bucketSeconds, long? lastPumpRunTs)
+    {
+        long bucketMs = bucketSeconds * 1000L;
+        long from = bucketMs == 0 ? sinceTs + 1 : sinceTs / bucketMs * bucketMs;
+        await using var db = await dbFactory.CreateDbContextAsync();
+        var points = await PointsAsync(db, from, endMs, bucketMs);
+        var (runs, lastRun) = await PumpRunsAsync(db, sinceTs - PumpWindowMs, endMs, countAfter: sinceTs, lastRun: lastPumpRunTs ?? 0);
+        var newOnly = db.Readings.Where(r => r.Ts > sinceTs && r.Ts <= endMs);
+        return new ChartUpdate(
+            Points: points,
+            NewPumpRuns: runs,
+            Lowest: await newOnly.MinAsync(r => (double?)r.Level),
+            Highest: await newOnly.MaxAsync(r => (double?)r.Level),
+            LastTs: await LastTsAsync(db, sinceTs + 1, endMs) ?? sinceTs,
+            LastPumpRunTs: lastRun > 0 ? lastRun : null);
     }
 
     // Turns ?hours= or ?start=&end= (Unix ms) into a window. Default: the last 24 h.
@@ -67,38 +94,49 @@ public class ReadingStore(IDbContextFactory<SumpDb> dbFactory)
         return steps[^1];
     }
 
-    static List<ChartPoint> Downsample(List<Reading> rows, long bucketMs)
-    {
-        if (bucketMs == 0)
-            return rows.Select(r => new ChartPoint(r.Ts, r.Level, r.Level, r.Level)).ToList();
+    static Task<long?> LastTsAsync(SumpDb db, long startMs, long endMs) =>
+        db.Readings.Where(r => r.Ts >= startMs && r.Ts <= endMs).MaxAsync(r => (long?)r.Ts);
 
-        return rows
-            .GroupBy(r => r.Ts / bucketMs)   // rows are sorted, so the groups come out in time order
-            .Select(g => new ChartPoint(
-                g.Key * bucketMs + bucketMs / 2,
-                Math.Round(g.Average(r => r.Level), 2),
-                g.Min(r => r.Level),
-                g.Max(r => r.Level)))
-            .ToList();
+    // Bucket averages are worked out by SQLite (GROUP BY), so only the ~2,000 chart points
+    // leave the database instead of every reading in the window.
+    static async Task<List<ChartPoint>> PointsAsync(SumpDb db, long startMs, long endMs, long bucketMs)
+    {
+        var range = db.Readings.AsNoTracking().Where(r => r.Ts >= startMs && r.Ts <= endMs);
+        if (bucketMs == 0)
+            return await range.OrderBy(r => r.Ts)
+                .Select(r => new ChartPoint(r.Ts, r.Level, r.Level, r.Level))
+                .ToListAsync();
+
+        var buckets = await range
+            .GroupBy(r => r.Ts / bucketMs)
+            .Select(g => new { Key = g.Key, V = g.Average(r => r.Level), Lo = g.Min(r => r.Level), Hi = g.Max(r => r.Level) })
+            .OrderBy(b => b.Key)
+            .ToListAsync();
+        return buckets.Select(b => new ChartPoint(b.Key * bucketMs + bucketMs / 2, Math.Round(b.V, 2), b.Lo, b.Hi)).ToList();
     }
 
-    static int CountPumpRuns(List<Reading> rows)
+    // Reads (time, level) pairs one at a time instead of loading the whole window into a list.
+    // Only runs found after countAfter are counted; earlier rows just give the 90 s of history.
+    static async Task<(int Runs, long LastRun)> PumpRunsAsync(SumpDb db, long startMs, long endMs, long countAfter, long lastRun)
     {
         int runs = 0;
-        long lastRun = 0;
-        for (int i = 1; i < rows.Count; i++)
+        var recent = new Queue<(long Ts, double Level)>();
+        var rows = db.Readings.AsNoTracking()
+            .Where(r => r.Ts >= startMs && r.Ts <= endMs)
+            .OrderBy(r => r.Ts)
+            .Select(r => new { r.Ts, r.Level })
+            .AsAsyncEnumerable();
+        await foreach (var r in rows)
         {
-            if (rows[i].Ts - lastRun < 180_000) continue;    // count each run once
-            for (int j = i - 1; j >= 0 && rows[i].Ts - rows[j].Ts <= 90_000; j--)
+            while (recent.Count > 0 && r.Ts - recent.Peek().Ts > PumpWindowMs) recent.Dequeue();
+            if (r.Ts > countAfter && r.Ts - lastRun >= PumpRunGapMs
+                && recent.Any(p => p.Level - r.Level >= PumpDropInches))
             {
-                if (rows[j].Level - rows[i].Level >= PumpDropInches)
-                {
-                    runs++;
-                    lastRun = rows[i].Ts;
-                    break;
-                }
+                runs++;
+                lastRun = r.Ts;
             }
+            recent.Enqueue((r.Ts, r.Level));
         }
-        return runs;
+        return (runs, lastRun);
     }
 }
