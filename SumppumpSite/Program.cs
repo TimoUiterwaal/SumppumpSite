@@ -2,6 +2,7 @@ using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.EntityFrameworkCore;
 using SumppumpSite;
 using SumppumpSite.Api;
@@ -28,6 +29,8 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
 		o.Cookie.Name = "sump.auth";
 		o.ExpireTimeSpan = TimeSpan.FromDays(30);
 		o.SlidingExpiration = true;
+		// Hosted: the cookie is only ever sent over HTTPS. Local development runs on plain http, so allow that there.
+		o.Cookie.SecurePolicy = builder.Environment.IsDevelopment() ? CookieSecurePolicy.SameAsRequest : CookieSecurePolicy.Always;
 		// API calls get a plain 401 instead of a redirect to the login page.
 		o.Events.OnRedirectToLogin = ctx =>
 		{
@@ -42,7 +45,22 @@ builder.Services.AddAuthorizationBuilder()
 	.SetFallbackPolicy(new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build());
 builder.Services.AddCascadingAuthenticationState();
 
-// At most 10 login page loads/attempts per 5 minutes from one IP address.
+// Azure App Service sits behind a proxy that passes the visitor's real IP address and the original
+// scheme (https) in X-Forwarded-* headers. Without them every visitor looks like the same address,
+// so the login rate limit below would be shared by everyone, and the app would think it's on plain http.
+// Only trusted on Azure: anywhere else a visitor could fake the header.
+// (Setting ASPNETCORE_FORWARDEDHEADERS_ENABLED=true does the same thing; don't apply it twice.)
+var behindAzureProxy = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBSITE_SITE_NAME"))
+	&& !builder.Configuration.GetValue<bool>("ForwardedHeaders_Enabled");
+builder.Services.Configure<ForwardedHeadersOptions>(o =>
+{
+	o.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+	o.KnownIPNetworks.Clear();
+	o.KnownProxies.Clear();
+});
+
+// At most 10 login attempts per 5 minutes from one IP address. Only attempts (POST) count,
+// so loading or refreshing the login page can't lock anyone out.
 builder.Services.AddRateLimiter(o =>
 {
 	o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
@@ -51,9 +69,11 @@ builder.Services.AddRateLimiter(o =>
 		ctx.HttpContext.Response.ContentType = "text/plain";
 		return new ValueTask(ctx.HttpContext.Response.WriteAsync("Too many login attempts. Wait 5 minutes and try again.", token));
 	};
-	o.AddPolicy("login", ctx => RateLimitPartition.GetFixedWindowLimiter(
-		ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
-		_ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(5) }));
+	o.AddPolicy("login", ctx => !HttpMethods.IsPost(ctx.Request.Method)
+		? RateLimitPartition.GetNoLimiter("page-load")
+		: RateLimitPartition.GetFixedWindowLimiter(
+			ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+			_ => new FixedWindowRateLimiterOptions { PermitLimit = 10, Window = TimeSpan.FromMinutes(5) }));
 });
 
 // SQLite file. Locally it sits in the project folder; on Azure set DbFile to /home/data/sump.db
@@ -73,9 +93,11 @@ using (var db = app.Services.GetRequiredService<IDbContextFactory<SumpDb>>().Cre
 }
 
 // Configure the HTTP request pipeline.
+if (behindAzureProxy) app.UseForwardedHeaders();   // first, so everything below sees the real IP and scheme
 if (!app.Environment.IsDevelopment())
 {
 	app.UseExceptionHandler("/Error", createScopeForErrors: true);
+	app.UseHsts();   // tells browsers to only ever use HTTPS for this site (sent on HTTPS responses only)
 }
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
 // No HTTPS redirect here: on Azure, turn on "HTTPS Only" instead. At home it runs on plain http.
