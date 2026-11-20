@@ -4,7 +4,13 @@ namespace SumppumpSite.Data;
 // V is their average, Lo and Hi the lowest and highest.
 public record ChartPoint(long T, double V, double Lo, double Hi);
 
-public record ChartData(int BucketSeconds, int PumpRuns, double? Lowest, double? Highest, List<ChartPoint> Points);
+// LastTs (newest reading in the window) and LastPumpRunTs let a live chart ask for only what's new.
+public record ChartData(int BucketSeconds, int PumpRuns, double? Lowest, double? Highest, List<ChartPoint> Points,
+    long? LastTs = null, long? LastPumpRunTs = null);
+
+// What changed since a live chart's last refresh. Points replace any chart points at or after Points[0].T.
+public record ChartUpdate(List<ChartPoint> Points, int NewPumpRuns, double? Lowest, double? Highest,
+    long? LastTs, long? LastPumpRunTs);
 
 // A horizontal line across the chart, in the same units as the level.
 public record ChartMark(double Y, string Label);

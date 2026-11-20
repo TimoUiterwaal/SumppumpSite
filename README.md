@@ -141,11 +141,10 @@ Any host that runs ASP.NET Core works. These steps are for Azure App Service on 
    | `Api__IngestKey` | the key |
    | `DbFile` | `/home/data/sump.db` |
    | `TZ` | your time zone, e.g. `America/Chicago` |
-   | `ASPNETCORE_FORWARDEDHEADERS_ENABLED` | `true` |
 
    - `DbFile` must be under `/home`, which survives restarts and redeploys. The app's own folder is replaced on every publish.
    - `TZ` sets the time shown in CSV downloads.
-   - `ASPNETCORE_FORWARDEDHEADERS_ENABLED` lets the login rate limit see each visitor's real IP address.
+   - On App Service the site reads each visitor's real IP address and the HTTPS scheme from Azure's proxy headers by itself. Behind a different reverse proxy, set `ASPNETCORE_FORWARDEDHEADERS_ENABLED` to `true`.
 4. Keep **Scale out** at 1 instance. SQLite can't be shared between instances.
 5. Publish: in Visual Studio, right-click the project → **Publish** → Azure App Service (Linux). From the CLI, run `dotnet publish -c Release` and deploy the output folder.
 
@@ -157,8 +156,9 @@ Publish profiles (`*.pubxml`) are in `.gitignore` because they contain your Azur
 
 - Every page and endpoint requires login unless it's marked `[AllowAnonymous]`. The exceptions are the login, error and not-found pages, static files, and the ESP32's `POST /api/readings`.
 - `POST /api/readings` requires the `X-Api-Key` header instead of a login, compared in constant time. If no key is configured, nothing can post.
-- Login attempts are limited to 10 per 5 minutes per IP address, with a 1-second delay after each wrong password.
+- Login attempts are limited to 10 per 5 minutes per IP address, with a 1-second delay after each wrong password. Loading the login page doesn't count.
 - Only the password hash is stored, using ASP.NET Core Identity's `PasswordHasher`. The login cookie lasts 30 days.
+- Outside the Development environment the login cookie is only sent over HTTPS, and the site sends an HSTS header. `dotnet run` uses Development, so plain http still works at home; a published build needs HTTPS in front of it or you can't log in.
 
 ## API
 

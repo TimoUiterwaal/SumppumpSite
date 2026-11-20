@@ -143,31 +143,68 @@ export function create(canvas, dotnetRef, markList) {
     plugins: [refLines, crosshair],
   });
   canvas.addEventListener('dblclick', onDblClick);
+  document.addEventListener('visibilitychange', onVisibility);
 }
 
-// points: [{ t, v, lo, hi }] from ReadingStore.ChartAsync
-export function setData(start, end, bucketSeconds, points) {
-  if (!chart) return;
-  bucketSec = bucketSeconds;
-  const gapMs = Math.max(60000, bucketSec * 3000);   // a longer hole means the ESP32 was offline: break the line
-  const hi = [], lo = [], line = [];
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    if (i && p.t - points[i - 1].t > gapMs) {
-      const x = (p.t + points[i - 1].t) / 2;
+// A longer hole between points means the ESP32 was offline: break the line there.
+const gapMs = () => Math.max(60000, bucketSec * 3000);
+
+// Adds points to the three datasets, with a null (line break) wherever there's a gap.
+function pushPoints(hi, lo, line, points) {
+  const gap = gapMs();
+  for (const p of points) {
+    const last = line.length ? line[line.length - 1] : null;
+    if (last && last.y !== null && p.t - last.x > gap) {
+      const x = (p.t + last.x) / 2;
       hi.push({ x, y: null }); lo.push({ x, y: null }); line.push({ x, y: null });
     }
     hi.push({ x: p.t, y: p.hi }); lo.push({ x: p.t, y: p.lo }); line.push({ x: p.t, y: p.v });
   }
-  const ds = chart.data.datasets;
-  ds[0].data = hi; ds[1].data = lo; ds[2].data = line;
-  ds[0].hidden = ds[1].hidden = bucketSec === 0;
+}
+
+function setWindow(start, end) {
   const x = chart.options.scales.x;
   x.min = start;
   x.max = end;
   x.time.unit = end - start > 2.5 * 86400e3 ? 'day' : false;   // label days, not hours, on long spans
+}
+
+// The whole window. points: [{ t, v, lo, hi }] from ReadingStore.ChartAsync
+export function setData(start, end, bucketSeconds, points) {
+  if (!chart) return;
+  bucketSec = bucketSeconds;
+  const hi = [], lo = [], line = [];
+  pushPoints(hi, lo, line, points);
+  const ds = chart.data.datasets;
+  ds[0].data = hi; ds[1].data = lo; ds[2].data = line;
+  ds[0].hidden = ds[1].hidden = bucketSec === 0;
+  setWindow(start, end);
   chart.update('none');
 }
+
+// Live update: only the new points (from ReadingStore.ChartUpdateAsync). Any points at or after
+// the first new one are replaced (the last bucket may have still been filling), and points that
+// slid out of the window are dropped.
+export function appendData(start, end, points) {
+  if (!chart) return;
+  const ds = chart.data.datasets, hi = ds[0].data, lo = ds[1].data, line = ds[2].data;
+  if (points.length) {
+    const first = points[0].t;
+    while (line.length && line[line.length - 1].x >= first) { hi.pop(); lo.pop(); line.pop(); }
+    pushPoints(hi, lo, line, points);
+  }
+  let n = 0;
+  while (n < line.length && (line[n].x < start || line[n].y === null)) n++;
+  if (n) { hi.splice(0, n); lo.splice(0, n); line.splice(0, n); }
+  setWindow(start, end);
+  chart.update('none');
+}
+
+// Tells the page when its browser tab is hidden or shown, so it can stop refreshing in the background.
+function onVisibility() {
+  if (dotnet) dotnet.invokeMethodAsync('OnVisibilityChange', document.hidden);
+}
+export function isHidden() { return document.hidden; }
 
 export function resetZoom() {
   zoomed = false;
@@ -184,6 +221,7 @@ export function saveHours(h) {
 }
 
 export function dispose() {
+  document.removeEventListener('visibilitychange', onVisibility);
   if (chart) {
     chart.canvas.removeEventListener('dblclick', onDblClick);
     chart.destroy();

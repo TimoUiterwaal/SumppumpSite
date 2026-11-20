@@ -30,7 +30,7 @@
     <section class="stats" aria-label="This window">
         <div class="stat"><div class="label">Lowest</div><div class="value">@Inches(chart?.Lowest)</div></div>
         <div class="stat"><div class="label">Highest</div><div class="value">@Inches(chart?.Highest)</div></div>
-        <div class="stat"><div class="label">Pump runs</div><div class="value">@(chart is { Points.Count: > 0 } ? chart.PumpRuns.ToString() : "–")</div></div>
+        <div class="stat"><div class="label">Pump runs</div><div class="value">@(hasPoints ? chart!.PumpRuns.ToString() : "–")</div></div>
     </section>
 
     <div class="chart-card">
@@ -55,18 +55,28 @@
     // your ESP32 calibration, these are inches from the floor.
     private static readonly ChartMark[] Marks = [new(7, "Pump starts"), new(18, "Backup pump starts")];
 
+    // While the chart follows "now", each 15 s refresh sends only the new readings. The whole
+    // window is reloaded this often anyway, so Lowest/Highest/Pump runs forget readings that
+    // slid out of the window.
+    private static readonly TimeSpan FullReloadEvery = TimeSpan.FromMinutes(15);
+
+    private enum ChartLoad { None, Live, Full }
+
     private ElementReference canvas;
     private IJSObjectReference? module;
     private DotNetObjectReference<Home>? selfRef;
     private readonly CancellationTokenSource cts = new();
 
     private bool loaded;
+    private bool hidden;          // browser tab in the background: no refreshes
     private int hours = 24;
     private bool zoomed;
     private long viewStart, viewEnd;
     private int loadSeq;
+    private DateTime lastFullLoad;
     private Reading? latest;
-    private ChartData? chart;
+    private ChartData? chart;     // stats and bookkeeping; the points themselves live in the browser
+    private bool hasPoints;
     private string? emptyMessage;
     private string? error;
 
@@ -77,15 +87,17 @@
         module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/sumpChart.js");
         selfRef = DotNetObjectReference.Create(this);
         await module.InvokeVoidAsync("create", canvas, selfRef, Marks);
+        hidden = await module.InvokeAsync<bool>("isHidden");
 
         var saved = await module.InvokeAsync<int?>("loadHours");
         if (saved is int h && Ranges.Any(r => r.Hours == h)) hours = h;
 
-        await RefreshAsync(includeChart: true);
+        await RefreshAsync(ChartLoad.Full);
         _ = RunTimerAsync();
     }
 
     // Every 5 s: redraw the "Updated … ago" line. Every 15 s: new data.
+    // Nothing at all while the tab is hidden; OnVisibilityChange catches up when it's shown.
     private async Task RunTimerAsync()
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
@@ -94,10 +106,11 @@
         {
             while (await timer.WaitForNextTickAsync(cts.Token))
             {
+                if (hidden) continue;
                 tick++;
                 await InvokeAsync(async () =>
                 {
-                    if (tick % 3 == 0) await RefreshAsync(includeChart: !zoomed);
+                    if (tick % 3 == 0) await RefreshAsync(zoomed ? ChartLoad.None : ChartLoad.Live);
                     else StateHasChanged();
                 });
             }
@@ -107,12 +120,22 @@
         catch (ObjectDisposedException) { }
     }
 
-    private async Task RefreshAsync(bool includeChart)
+    // Called by sumpChart.js when the browser tab is hidden or shown again.
+    [JSInvokable]
+    public async Task OnVisibilityChange(bool isHidden)
+    {
+        hidden = isHidden;
+        if (!hidden) await RefreshAsync(zoomed ? ChartLoad.None : ChartLoad.Live);
+    }
+
+    private async Task RefreshAsync(ChartLoad load)
     {
         try
         {
             latest = await Store.LatestAsync();
-            if (includeChart)
+            if (load == ChartLoad.Live && (chart is null || DateTime.UtcNow - lastFullLoad >= FullReloadEvery))
+                load = ChartLoad.Full;
+            if (load == ChartLoad.Full)
             {
                 if (!zoomed)
                 {
@@ -121,6 +144,8 @@
                 }
                 await LoadChartAsync();
             }
+            else if (load == ChartLoad.Live)
+                await AppendChartAsync();
             error = null;
         }
         catch (Exception ex) when (ex is not JSDisconnectedException and not OperationCanceledException)
@@ -131,6 +156,7 @@
         StateHasChanged();
     }
 
+    // The whole window: about 1,500–2,000 points.
     private async Task LoadChartAsync()
     {
         var my = ++loadSeq;
@@ -138,11 +164,40 @@
         var data = await Store.ChartAsync(start, end);
         if (my != loadSeq) return;   // a newer load (zoom, range change) already replaced this one
 
-        chart = data;
-        emptyMessage = data.Points.Count == 0 ? "No readings in this window yet." : null;
+        chart = data with { Points = [] };
+        hasPoints = data.Points.Count > 0;
+        lastFullLoad = DateTime.UtcNow;
+        emptyMessage = hasPoints ? null : "No readings in this window yet.";
         if (module is not null)
             await module.InvokeVoidAsync("setData", start, end, data.BucketSeconds, data.Points);
     }
+
+    // Slides the window to "now" and sends only readings newer than the chart's newest one.
+    private async Task AppendChartAsync()
+    {
+        var old = chart!;
+        var my = ++loadSeq;
+        var end = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var start = end - hours * 3_600_000L;
+        var u = await Store.ChartUpdateAsync(old.LastTs ?? viewStart, end, old.BucketSeconds, old.LastPumpRunTs);
+        if (my != loadSeq) return;
+
+        (viewStart, viewEnd) = (start, end);
+        chart = old with
+        {
+            PumpRuns = old.PumpRuns + u.NewPumpRuns,
+            Lowest = Lower(old.Lowest, u.Lowest),
+            Highest = Higher(old.Highest, u.Highest),
+            LastTs = u.LastTs,
+            LastPumpRunTs = u.LastPumpRunTs,
+        };
+        if (u.Points.Count > 0) { hasPoints = true; emptyMessage = null; }
+        if (module is not null)
+            await module.InvokeVoidAsync("appendData", start, end, u.Points);
+    }
+
+    private static double? Lower(double? a, double? b) => a is null ? b : b is null ? a : Math.Min(a.Value, b.Value);
+    private static double? Higher(double? a, double? b) => a is null ? b : b is null ? a : Math.Max(a.Value, b.Value);
 
     private async Task PickRange(int h)
     {
@@ -155,7 +210,7 @@
     {
         zoomed = false;
         if (module is not null) await module.InvokeVoidAsync("resetZoom");
-        await RefreshAsync(includeChart: true);
+        await RefreshAsync(ChartLoad.Full);
     }
 
     // Called by sumpChart.js after a drag or pinch zoom.
